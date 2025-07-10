@@ -2,14 +2,22 @@ import pandas as pd
 import subprocess
 import sys
 import json
-from eastmoney_fetcher import (
+import os
+
+# 将项目根目录添加到Python路径中，以允许从 'fetchers' 目录导入模块
+# 这解决了当从 'app' 目录运行脚本时出现的模块未找到问题
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
+from fetchers.eastmoney_fetcher import (
     crawl_stock_ranking_data, 
     get_market_options
 )
 # All detail fetchers are now called via subprocess
 # from hk_details_fetcher import fetch_hk_stock_details
 # from stock_details_fetcher import get_stock_details 
-from news_fetcher import get_company_news
+# from fetchers.news_fetcher import get_company_news
 
 def get_integrated_market_data(market_name):
     """
@@ -33,6 +41,8 @@ def get_integrated_stock_details(stock_code, market_name):
     market_type = get_market_options().get(market_name, {}).get("type")
 
     script_name = ""
+    script_dir = "fetchers"  # 定义脚本所在的目录
+
     if market_type == "A-Share":
         script_name = "stock_details_fetcher.py"
     elif market_type == "HK-Share":
@@ -49,7 +59,9 @@ def get_integrated_stock_details(stock_code, market_name):
         }
 
     try:
-        command = [sys.executable, script_name, stock_code]
+        # 构建脚本的完整路径
+        script_path = os.path.join(script_dir, script_name)
+        command = [sys.executable, script_path, stock_code]
         
         # --- 增加的调试输出 ---
         print("\n" + "="*50)
@@ -104,7 +116,7 @@ def get_integrated_stock_details(stock_code, market_name):
                 'financial_data': financial_df,
                 'financial_raw_data': financial_raw_data,
                 'error_msg': error_msg,
-                'news_data': get_company_news(stock_code),
+                'news_data': [], # No news data if financial data fails
                 'details_url': None
             }
         
@@ -133,7 +145,7 @@ def get_integrated_stock_details(stock_code, market_name):
                 'financial_data': financial_df,
                 'financial_raw_data': financial_raw_data,
                 'error_msg': error_msg,
-                'news_data': get_company_news(stock_code),
+                'news_data': [], # No news data if financial data fails
                 'details_url': None
             }
 
@@ -165,9 +177,13 @@ def get_integrated_stock_details(stock_code, market_name):
         financial_df, financial_raw_data = _get_fallback_financial_data()
 
 
-    # 从独立的新闻模块获取新闻资讯
-    news_data = get_company_news(stock_code)
-    
+    # 通过子进程获取新闻资讯，以隔离Playwright环境
+    news_data, news_error = _get_news_via_subprocess(stock_code)
+    if news_error:
+        # 如果财务数据部分没有错误，就用新闻部分的错误覆盖
+        if not error_msg:
+            error_msg = news_error
+
     # A股URL在raw_data['comparison_data']['url']
     # 港股URL在raw_data['url']
     details_url = financial_raw_data.get('comparison_data', {}).get('url') or financial_raw_data.get('url')
@@ -179,6 +195,36 @@ def get_integrated_stock_details(stock_code, market_name):
         'news_data': news_data,
         'details_url': details_url
     }
+
+def _get_news_via_subprocess(stock_code):
+    """
+    通过子进程执行 news_fetcher.py 来获取新闻，避免主进程中的Playwright冲突。
+    :param stock_code: 股票代码
+    :return: (list, str or None) 返回新闻列表和错误信息
+    """
+    script_path = os.path.join("fetchers", "news_fetcher.py")
+    command = [sys.executable, script_path, stock_code]
+
+    try:
+        process = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            encoding='utf-8',
+            check=True,
+            timeout=60
+        )
+        news_data = json.loads(process.stdout)
+        return news_data, None
+    except subprocess.CalledProcessError as e:
+        error_message = f"获取新闻子进程执行失败: {e.stderr}"
+        return [], error_message
+    except (json.JSONDecodeError, FileNotFoundError) as e:
+        error_message = f"处理新闻子进程时出错: {str(e)}"
+        return [], error_message
+    except subprocess.TimeoutExpired:
+        error_message = "获取新闻数据超时"
+        return [], error_message
 
 def _get_fallback_financial_data():
     """Returns a default empty/NA structure for financial data on error."""

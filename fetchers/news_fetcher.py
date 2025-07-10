@@ -2,6 +2,8 @@ import json
 from bs4 import BeautifulSoup
 from datetime import datetime
 from playwright.sync_api import sync_playwright
+import sys
+import argparse
 
 def get_company_news(stock_code, max_pages=1):
     """
@@ -11,6 +13,8 @@ def get_company_news(stock_code, max_pages=1):
     :return: list of news articles or an empty list
     """
     all_articles = []
+    # 脚本执行时，禁止打印任何非JSON内容到stdout，以确保输出纯净
+    # print(f"--- 正在抓取第 {page_num} 页 ---")
     
     try:
         with sync_playwright() as p:
@@ -23,14 +27,14 @@ def get_company_news(stock_code, max_pages=1):
             page.goto(url, timeout=30000, wait_until='domcontentloaded')
 
             for page_num in range(1, max_pages + 1):
-                print(f"--- 正在抓取第 {page_num} 页 ---")
+                # print(f"--- 正在抓取第 {page_num} 页 ---")
                 
                 # 等待新闻列表容器加载完成
                 news_list_selector = "div.news_list"
                 try:
                     page.wait_for_selector(news_list_selector, timeout=20000)
                 except Exception:
-                    print(f"第 {page_num} 页没有找到新闻列表，抓取结束。")
+                    # print(f"第 {page_num} 页没有找到新闻列表，抓取结束。")
                     break
                 
                 # 获取第一条新闻的标题，用于之后判断页面是否已更新
@@ -41,7 +45,7 @@ def get_company_news(stock_code, max_pages=1):
                     # 等待第一个新闻项可见
                     first_item_on_page.wait_for(timeout=5000)
                 except Exception:
-                     print("当前页没有新闻或新闻列表不可见，抓取结束。")
+                     # print("当前页没有新闻或新闻列表不可见，抓取结束。")
                      break
                 
                 old_first_title = first_item_on_page.inner_text()
@@ -88,10 +92,10 @@ def get_company_news(stock_code, max_pages=1):
                                 }
                             """, arg=old_first_title, timeout=15000)
                         except Exception as e:
-                            print(f"翻到下一页时超时或发生错误，抓取结束: {e}")
+                            # print(f"翻到下一页时超时或发生错误，抓取结束: {e}")
                             break
                     else:
-                        print("找不到'下一页'按钮，抓取结束。")
+                        # print("找不到'下一页'按钮，抓取结束。")
                         break
             
             context.close()
@@ -100,35 +104,23 @@ def get_company_news(stock_code, max_pages=1):
         return all_articles
 
     except Exception as e:
-        print(f"[ERROR] A critical error occurred in news fetcher: {e}")
+        # 错误信息应该打印到stderr，而不是stdout
+        print(f"[ERROR] A critical error occurred in news fetcher: {e}", file=sys.stderr)
         return []
 
-if __name__ == "__main__":
-    # --- Test Function ---
-    # 测试获取腾讯控股 (00700) 的新闻
-    test_code = '00700'
-    num_pages_to_fetch = 2
-    print(f"--- 正在测试获取股票代码: {test_code} (腾讯控股) 的新闻 (前 {num_pages_to_fetch} 页) ---")
-    
-    news_list = get_company_news(test_code, max_pages=num_pages_to_fetch)
-    
-    if news_list:
-        print(f"成功获取到 {len(news_list)} 条新闻：")
-        # 只打印部分结果以方便查看
-        for i, news in enumerate(news_list[:25], 1): # Display up to 25 results
-            title = news.get('title', '无标题')
-            url = news.get('url', '无链接')
-            publish_time = news.get('publishTime', 0)
-            
-            try:
-                if isinstance(publish_time, (int, float)) and publish_time > 0:
-                    date_str = datetime.fromtimestamp(publish_time).strftime('%Y-%m-%d %H:%M:%S')
-                else:
-                    date_str = "未知时间"
-            except (ValueError, TypeError):
-                date_str = "时间格式错误"
+def main():
+    """
+    脚本主入口：解析命令行参数，获取新闻并以JSON格式输出。
+    """
+    parser = argparse.ArgumentParser(description="获取指定股票代码的公司新闻。")
+    parser.add_argument("stock_code", help="要查询的股票代码")
+    parser.add_argument("--pages", type=int, default=1, help="要抓取的页数，默认为1")
+    args = parser.parse_args()
 
-            print(f"{i}. [{date_str}] {title}")
-            print(f"   链接: {url}")
-    else:
-        print("未能获取到新闻或发生错误。") 
+    news_list = get_company_news(args.stock_code, max_pages=args.pages)
+    
+    # 将结果以JSON格式打印到stdout
+    print(json.dumps(news_list, ensure_ascii=False))
+
+if __name__ == "__main__":
+    main() 
