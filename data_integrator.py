@@ -6,7 +6,8 @@ from eastmoney_fetcher import (
     crawl_stock_ranking_data, 
     get_market_options
 )
-# The direct import is no longer needed as we call it via subprocess
+# All detail fetchers are now called via subprocess
+# from hk_details_fetcher import fetch_hk_stock_details
 # from stock_details_fetcher import get_stock_details 
 from news_fetcher import get_company_news
 
@@ -18,49 +19,165 @@ def get_integrated_market_data(market_name):
     """
     return crawl_stock_ranking_data(market_name)
 
-def get_integrated_stock_details(stock_code):
+def get_integrated_stock_details(stock_code, market_name):
     """
-    通过独立的子进程执行stock_details_fetcher.py脚本，以隔离Playwright环境。
+    通过独立的子进程执行相应的详情获取脚本 (A股或港股)，以隔离Playwright环境。
     :param stock_code: 股票代码
+    :param market_name: 市场名称 ("沪深京A股" 或 "知名港股")
     :return: dict 包含财务数据和新闻资讯
     """
+    error_msg = None
+    financial_df = None
+    financial_raw_data = {}
+    
+    market_type = get_market_options().get(market_name, {}).get("type")
+
+    script_name = ""
+    if market_type == "A-Share":
+        script_name = "stock_details_fetcher.py"
+    elif market_type == "HK-Share":
+        script_name = "hk_details_fetcher.py"
+    else:
+        error_msg = f"未知的市场类型: {market_name}"
+        financial_df, financial_raw_data = _get_fallback_financial_data()
+        # Early return if market type is invalid
+        return {
+            'financial_data': financial_df,
+            'financial_raw_data': financial_raw_data,
+            'error_msg': error_msg,
+            'news_data': []
+        }
+
     try:
-        # Construct the command to run the fetcher script
-        command = [sys.executable, "stock_details_fetcher.py", stock_code]
+        command = [sys.executable, script_name, stock_code]
         
-        # Execute the command
+        # --- 增加的调试输出 ---
+        print("\n" + "="*50)
+        print("--- [DEBUG] Pre-subprocess Execution Info ---")
+        print(f"    Market Name Received: {market_name}")
+        print(f"    Determined Market Type: {market_type}")
+        print(f"    Selected Script: {script_name}")
+        print(f"    Full Command: {' '.join(command)}")
+        print("="*50 + "\n")
+        # --- 调试输出结束 ---
+
         process = subprocess.run(
             command,
             capture_output=True,
-            text=True,
-            check=True,  # Raise an exception for non-zero exit codes
-            encoding='utf-8',
-            timeout=90  # 90-second timeout for the whole process
+            # text=True and encoding='utf-8' are removed. We will handle decoding manually.
+            check=False, # We also set check=False to handle non-zero exits manually.
+            timeout=90
         )
         
-        # Parse the JSON output from the script
-        result = json.loads(process.stdout)
-        financial_df = pd.read_json(result['dataframe'], orient='split')
-        financial_raw_data = result['raw_data']
-        error_msg = result['error']
+        stdout_str = ""
+        stderr_str = ""
+
+        # Manually decode stdout and stderr to handle potential encoding issues on Windows
+        try:
+            stdout_str = process.stdout.decode('utf-8')
+        except UnicodeDecodeError:
+            stdout_str = process.stdout.decode('gbk', errors='ignore') # Fallback to gbk
+
+        try:
+            stderr_str = process.stderr.decode('utf-8')
+        except UnicodeDecodeError:
+            stderr_str = process.stderr.decode('gbk', errors='ignore') # Fallback to gbk
+
+        # 打印子进程的输出以供调试
+        print(f"--- [DEBUG] 子进程输出 ({script_name} {stock_code}) ---")
+        if stdout_str:
+            print("--- STDOUT ---")
+            print(stdout_str)
+        if stderr_str:
+            print("--- STDERR ---", file=sys.stderr)
+            print(stderr_str, file=sys.stderr)
+        print("-----------------------------------------------------\n")
+        
+        # Now, check for errors or empty output
+        if process.returncode != 0 and not stdout_str: # check 'and'
+            error_msg = f"子进程 {script_name} 执行失败或无返回。"
+            if stderr_str:
+                error_msg += f" 错误信息: {stderr_str}"
+            financial_df, financial_raw_data = _get_fallback_financial_data()
+            # Skip to the end after setting the error
+            return {
+                'financial_data': financial_df,
+                'financial_raw_data': financial_raw_data,
+                'error_msg': error_msg,
+                'news_data': get_company_news(stock_code),
+                'details_url': None
+            }
+        
+        # [FIX] Clean the subprocess output to extract only the valid JSON object.
+        # This handles cases where debug prints from the subprocess are mixed with the JSON output.
+        json_str = None
+        brace_level = 0
+        json_start = -1
+
+        for i, char in enumerate(stdout_str):
+            if char == '{':
+                if brace_level == 0:
+                    json_start = i
+                brace_level += 1
+            elif char == '}':
+                if brace_level > 0:
+                    brace_level -= 1
+                    if brace_level == 0:
+                        json_str = stdout_str[json_start : i + 1]
+                        break
+        
+        if not json_str:
+            error_msg = f"无法从子进程输出中提取有效的JSON数据。原始输出: {stdout_str[:200]}..."
+            financial_df, financial_raw_data = _get_fallback_financial_data()
+            return {
+                'financial_data': financial_df,
+                'financial_raw_data': financial_raw_data,
+                'error_msg': error_msg,
+                'news_data': get_company_news(stock_code),
+                'details_url': None
+            }
+
+
+        result = json.loads(json_str)
+        # More robust handling of the returned JSON
+        financial_df_json = result.get('dataframe')
+        if financial_df_json:
+            financial_df = pd.read_json(financial_df_json, orient='split')
+        else:
+            financial_df = None
+            
+        financial_raw_data = result.get('raw_data', {})
+        error_msg = result.get('error') # Handles if key is missing or value is None
+
+        if financial_df is None and not error_msg:
+             error_msg = f"从 {script_name} 未能获取 {stock_code} 的有效数据。"
+        
+        # Fallback only if the dataframe is truly empty
+        if financial_df is None:
+             financial_df, financial_raw_data = _get_fallback_financial_data()
+
 
     except subprocess.TimeoutExpired:
-        error_msg = "获取财务数据超时"
+        error_msg = f"获取 {market_name} 财务数据超时"
         financial_df, financial_raw_data = _get_fallback_financial_data()
-    except (subprocess.CalledProcessError, json.JSONDecodeError, KeyError) as e:
-        error_msg = f"处理财务数据子进程时出错: {e}"
-        if isinstance(e, subprocess.CalledProcessError):
-            error_msg += f" - Stderr: {e.stderr}"
+    except (json.JSONDecodeError, KeyError) as e: # Removed CalledProcessError as we handle it manually
+        error_msg = f"处理 {market_name} 财务数据子进程时出错: {e}"
         financial_df, financial_raw_data = _get_fallback_financial_data()
+
 
     # 从独立的新闻模块获取新闻资讯
     news_data = get_company_news(stock_code)
     
+    # A股URL在raw_data['comparison_data']['url']
+    # 港股URL在raw_data['url']
+    details_url = financial_raw_data.get('comparison_data', {}).get('url') or financial_raw_data.get('url')
+
     return {
         'financial_data': financial_df,
         'financial_raw_data': financial_raw_data,
         'error_msg': error_msg,
-        'news_data': news_data
+        'news_data': news_data,
+        'details_url': details_url
     }
 
 def _get_fallback_financial_data():

@@ -46,8 +46,17 @@ def _scrape_financial_analysis_with_playwright(full_code):
     """
     使用Playwright访问页面，等待JS动态加载财务数据表格后抓取。
     """
-    url_code = full_code.lower()
-    url = f"https://quote.eastmoney.com/{url_code}.html"
+    url = ""
+    # 根据股票代码规则（特别是科创板）构建正确的URL
+    if full_code.startswith("SH688"):
+        # 科创板 (STAR Market) URL格式: https://quote.eastmoney.com/kcb/688585.html
+        stock_number = full_code[2:] # 从 "SH688585" 中提取 "688585"
+        url = f"https://quote.eastmoney.com/kcb/{stock_number}.html"
+    else:
+        # 其他所有A股 (沪深主板, 创业板等) URL格式: https://quote.eastmoney.com/sz301120.html
+        url = f"https://quote.eastmoney.com/{full_code.lower()}.html"
+
+    print(f"正在访问A股URL: {url}")
 
     try:
         with sync_playwright() as p:
@@ -59,10 +68,17 @@ def _scrape_financial_analysis_with_playwright(full_code):
             table_container_selector = "div.finance4"
             page.wait_for_selector(table_container_selector, timeout=20000)
             
+            # [FIX 1] Add a hard delay to wait for dynamic content to be loaded.
+            page.wait_for_timeout(2000)
+
             table_html = page.locator(table_container_selector).inner_html()
             browser.close()
             
-            return _parse_financial_table_html(table_html)
+            parsed_data, error = _parse_financial_table_html(table_html)
+            # 将URL添加到解析成功的数据中，以便向上传递
+            if parsed_data:
+                parsed_data['url'] = url
+            return parsed_data, error
 
     except PlaywrightTimeoutError as e:
         return None, f"页面加载或元素定位超时。未能在页面上动态加载出财务数据表格 ('div.finance4')。错误: {e}"
@@ -184,10 +200,12 @@ if __name__ == '__main__':
 
     # Serialize DataFrame to JSON and combine with other data
     result = {
-        "dataframe": df.to_json(orient='split'),
+        "dataframe": df.to_json(orient='split', index=False), # DataFrame转为JSON字符串
         "raw_data": raw_data,
         "error": error
     }
     
-    # Print the final result as a JSON string to stdout
-    print(json.dumps(result)) 
+    # [FIX 2] Print the final result as a UTF-8 encoded JSON string to stdout's byte buffer.
+    # This is the definitive way to fix encoding issues in subprocess communication.
+    encoded_result = json.dumps(result, ensure_ascii=False).encode('utf-8')
+    sys.stdout.buffer.write(encoded_result) 
