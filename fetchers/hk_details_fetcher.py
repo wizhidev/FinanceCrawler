@@ -13,7 +13,7 @@ def fetch_hk_stock_details(stock_code: str):
         stock_code (str): 港股代码 (例如: '00700').
 
     Returns:
-        dict: 包含 'financial_data' (DataFrame) 和 'error_msg' 的字典。
+        tuple: (DataFrame | None, dict | None, str | None) -> (财务数据, 原始数据, 错误信息)
     """
     if len(stock_code) < 5 and stock_code.isdigit():
         stock_code = stock_code.zfill(5)
@@ -38,26 +38,23 @@ def fetch_hk_stock_details(stock_code: str):
             # 短暂延时，确保所有JS渲染完毕
             time.sleep(1)
 
-            # [FIX] Get the container's HTML to pass to the correct parsing function
             finance_div = page.locator(finance_div_selector)
             html_content = finance_div.inner_html()
             browser.close()
 
-            # [FIX] Call the correct, centralized parsing function
             parsed_data, error_message = _parse_hk_financial_table(html_content)
 
             if error_message:
-                print(f"错误: {error_message}")
-                return {'financial_data': None, 'error_msg': error_message}
+                return None, None, error_message
                 
-            # [FIX] Create DataFrame from the correctly parsed data
             df = pd.DataFrame(parsed_data['all_rows'], columns=parsed_data['headers'])
-            return {'financial_data': df, 'error_msg': None, 'raw_data': parsed_data}
+            # 【核心修复】返回元组，与其他fetcher保持一致
+            return df, parsed_data, None
 
         except Exception as e:
             error_message = f"使用 Playwright 抓取或解析港股 {stock_code} 数据时发生错误: {e}"
-            print(error_message)
-            return {'financial_data': None, 'error_msg': error_message}
+            # 【核心修复】返回元组，与其他fetcher保持一致
+            return None, None, error_message
 
 def _parse_hk_financial_table(html_content):
     """
@@ -116,25 +113,23 @@ def _parse_hk_financial_table(html_content):
     }
     return parsed_data, None
 
+
 if __name__ == '__main__':
     # 为了让这个脚本可以被 data_integrator 通过 subprocess 调用，
     # 我们将结果序列化为JSON并打印到标准输出。
-    # 这也统一了A股和港股详情获取脚本的行为模式。
     if len(sys.argv) > 1:
         stock_code_arg = sys.argv[1]
-        details = fetch_hk_stock_details(stock_code_arg)
+        # 【核心修复】按元组格式接收返回值
+        df, raw_data, error = fetch_hk_stock_details(stock_code_arg)
         
         output = {
             'dataframe': None,
-            'raw_data': {}, # 港股脚本目前不提供原始数据
-            'error': details['error_msg']
+            'raw_data': raw_data or {}, # 如果raw_data是None，则使用空字典
+            'error': error
         }
         
-        if details['financial_data'] is not None:
-            output['dataframe'] = details['financial_data'].to_json(orient='split', force_ascii=False)
-            # [FIX] Pass the raw_data upstream
-            if 'raw_data' in details:
-                output['raw_data'] = details['raw_data']
+        if df is not None:
+            output['dataframe'] = df.to_json(orient='split', force_ascii=False)
             
         import json
         print(json.dumps(output, ensure_ascii=False))
@@ -143,10 +138,12 @@ if __name__ == '__main__':
         print("Running in test mode. To fetch a stock, provide its code as an argument.")
         test_codes = ['00700', '03690', '09988']
         for code in test_codes:
-            details_result = fetch_hk_stock_details(code)
-            if details_result and details_result.get('financial_data') is not None:
+            # 【核心修复】按元组格式接收返回值并进行判断
+            df, _, error = fetch_hk_stock_details(code)
+            if error:
+                 print(f"\n--- 未能获取股票代码: {code} 的信息 ---. 原因: {error}")
+            elif df is not None:
                 print(f"\n--- 股票代码: {code} 的详细信息 ---")
-                print(details_result['financial_data'].to_string())
+                print(df.to_string())
             else:
-                error = details_result.get('error_msg', '未知错误') if details_result else '未知错误'
-                print(f"\n--- 未能获取股票代码: {code} 的信息 ---. 原因: {error}") 
+                print(f"\n--- 未能获取股票代码: {code} 的信息 ---. 原因: 未知错误") 
